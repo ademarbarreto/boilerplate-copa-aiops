@@ -24,19 +24,6 @@ services:
     networks:
       - aiops
 
-  mcp-kubernetes:
-    image: mcp/kubernetes:latest
-    volumes:
-      - /home/fabricioveronez/.kube:/home/appuser/.kube
-    environment:
-      ENABLE_UNSAFE_STREAMABLE_HTTP_TRANSPORT: 1
-      PORT: 3001
-      HOST: "0.0.0.0"
-    ports:
-      - "3001:3001"
-    networks:
-      - aiops
-
 volumes:
   postgres_data:
 

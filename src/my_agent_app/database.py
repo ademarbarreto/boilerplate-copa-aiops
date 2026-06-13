@@ -3,7 +3,7 @@ import os
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
-DEFAULT_DATABASE_URL = "postgresql+asyncpg://appuser:apppass123@localhost:5432/app_db"
+DEFAULT_DATABASE_URL = "postgresql+asyncpg://aiops:aiops123@localhost:5432/aiops_k8s"
 
 
 def get_database_url() -> str:

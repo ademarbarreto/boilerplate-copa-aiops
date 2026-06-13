@@ -43,14 +43,15 @@ references: []
 Como engenheiro de plataforma, quero acessar uma página web com a listagem de todos os relatórios de análise, para ter visibilidade do histórico de problemas investigados no cluster.
 
 **Rules:**
-- A página exibe todos os relatórios ordenados por data de criação (mais recente primeiro)
-- Cada item da lista exibe: ID, data de criação, status e resumo (primeiras linhas da causa raiz)
+- A página exibe todos os relatórios ordenados por `created_at` decrescente (mais recente primeiro)
+- Cada item da lista exibe: ID, data de criação (`created_at`), status e tabela de resumo de severidade (seção `## Resumo` do Markdown)
 - Cada item é clicável e leva à página de detalhe
 - A página é servida pela própria API FastAPI com template Jinja2
+- O status é exibido como badge com mapeamento para classes CSS do `base.html`: EM_ANALISE → `badge-processing`, COMPLETO → `badge-complete`, INCOMPLETO → `badge-incomplete`, CORRIGINDO → `badge-executing`, CORRIGIDO → `badge-executed`, FALHA_CORRECAO → `badge-execution-failed`
 
 **Edge cases:**
 - Nenhum relatório no banco → exibir página com mensagem informativa ("Nenhum relatório encontrado")
-- Erro de conexão com o PostgreSQL → exibir página de erro genérica com mensagem amigável (inferido — validar)
+- Erro de conexão com o PostgreSQL → capturar exceção SQLAlchemy e renderizar `error.html` com `status_code=503` e mensagem "Banco de dados indisponível, tente novamente em instantes"
 
 ### US02: Visualização detalhada do relatório
 
@@ -60,12 +61,13 @@ Como engenheiro de plataforma, quero visualizar o conteúdo completo de um relat
 - A página renderiza o conteúdo Markdown completo do relatório em HTML
 - Exibe o status atual do relatório
 - Inclui botão "Executar correção" que aciona o agente de correção (PRD 004)
-- O botão de correção só é exibido para relatórios com status COMPLETO
+- O botão de correção é exibido para relatórios com status COMPLETO ou FALHA_CORRECAO (FALHA_CORRECAO permite nova tentativa após falha de correção)
+- O `id` do relatório é do tipo UUID; o parâmetro `{id}` na rota é validado pelo FastAPI como `uuid.UUID`
 
 **Edge cases:**
-- Relatório com Markdown malformado → renderizar o que for possível, sem quebrar a página (inferido — validar)
+- Relatório com Markdown malformado → comportamento nativo da biblioteca `markdown`: produz HTML parcial sem lançar exceção; nenhuma lógica adicional necessária
 - Relatório não encontrado (ID inválido) → retornar página 404 com mensagem informativa
-- Usuário clica em "Executar correção" com correção já em andamento para o mesmo relatório → impedir execução duplicada e informar que a correção está em andamento (inferido — validar)
+- Usuário clica em "Executar correção" com correção já em andamento → botão não é exibido para status diferente de COMPLETO/FALHA_CORRECAO (regra acima); se `POST /reports/{id}/fix` retornar 409 (PRD 004), exibir mensagem "Correção já em andamento" na página de detalhe
 
 ## 4. Critérios de Aceite
 
@@ -75,7 +77,7 @@ Como engenheiro de plataforma, quero visualizar o conteúdo completo de um relat
 |----------|----------------------|
 | Interface web lista todos os relatórios com status | Teste manual em navegador |
 | Página de detalhe renderiza Markdown completo | Teste manual com relatórios de diferentes complexidades |
-| Botão de correção aparece apenas para relatórios COMPLETO | Teste manual com relatórios em diferentes status |
+| Botão de correção aparece para relatórios COMPLETO ou FALHA_CORRECAO | Teste manual com relatórios em diferentes status |
 
 ### De negócio
 
@@ -92,9 +94,10 @@ Este PRD é um habilitador de visualização; não possui métrica de negócio p
 - [ ] Criar template Jinja2 de listagem de relatórios (US01)
 - [ ] Criar rota FastAPI para listagem (`GET /reports`) (US01)
 - [ ] Criar template Jinja2 de detalhe do relatório com renderização Markdown (US02)
-- [ ] Criar rota FastAPI para detalhe (`GET /reports/{id}`) (US02)
+- [ ] Criar rota FastAPI para detalhe (`GET /reports/{id: UUID}`) (US02)
 - [ ] Adicionar botão "Executar correção" com controle de estado (US02)
 - [ ] Tratar cenários de erro (banco indisponível, relatório não encontrado) (US01, US02)
+- [ ] Adicionar estilos CSS para conteúdo Markdown renderizado no template de detalhe (US02)
 
 **Critério de conclusão:**
 - Condição: Interface web exibe listagem e detalhe dos relatórios corretamente
@@ -113,7 +116,7 @@ Este PRD é um habilitador de visualização; não possui métrica de negócio p
 |-------------|------|--------|----------------------|
 | PRD 002 — Relatórios no PostgreSQL | Interna | Em desenvolvimento | Sem relatórios, não há o que exibir |
 | Jinja2 | Externa | Disponível | Renderização dos templates |
-| Biblioteca de renderização Markdown → HTML | Externa | A definir | Necessária para exibir relatórios formatados |
+| Biblioteca de renderização Markdown → HTML (`markdown`) | Externa | Disponível — `markdown>=3.7` declarado em `pyproject.toml` | Necessária para exibir relatórios formatados |
 
 ## 7. Referências
 
@@ -122,6 +125,9 @@ Este PRD é um habilitador de visualização; não possui métrica de negócio p
 
 ## 8. Registro de Decisões
 
+- **2026-06-13:** Botão "Executar correção" passa a ser exibido também para relatórios em FALHA_CORRECAO (além de COMPLETO). Motivo: FALHA_CORRECAO deixou de ser estado terminal e admite nova tentativa de correção (decisão do usuário em revisão de 2026-06-13, propagada do PRD 004). O endpoint `POST /reports/{id}/fix` (PRD 004) aceita ambos os status.
+- **2026-06-10:** Campo `id` do relatório definido como UUID. Motivo: exposição em URL requer identificador opaco; compatível com a definição propagada ao PRD 002.
+- **2026-06-10:** Resumo na listagem exibe a tabela de severidade (seção `## Resumo` do Markdown). Motivo: sempre presente na estrutura do relatório (PRD 002); extração simples sem parsing de cada problema.
 - **2026-06-09:** Removida a notificação via Discord do escopo deste PRD. Motivo: simplificação do projeto. A interface web passa a ser o único canal de visualização e acionamento da correção. Removidas a US03, o Milestone de notificação, a variável `APP_BASE_URL` e a dependência do bot Discord.
 - **2026-03-13:** Jinja2 para interface web. Motivo: server-side renderizada pela própria API, sem frontend separado.
 - **2026-03-13:** Sem autenticação na v1. Motivo: simplicidade da primeira entrega.

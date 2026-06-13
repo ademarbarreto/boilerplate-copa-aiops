@@ -5,7 +5,7 @@ priority: alta
 created: 2026-03-22
 issue:
 depends_on: []
-references: []
+references: ["002"]
 ---
 
 # PRD 001: Coleta Automática de Eventos do Cluster Kubernetes
@@ -23,7 +23,7 @@ references: []
 - Loop interno na aplicação FastAPI que executa periodicamente a coleta de eventos do cluster
 - Utiliza o Python SDK do Kubernetes (`kubernetes`) para listar eventos de todos os namespaces
 - Filtra apenas eventos do tipo Warning
-- Coleta apenas eventos ocorridos dentro do intervalo do loop (evita reprocessamento de eventos antigos)
+- Coleta apenas eventos ocorridos desde a última coleta bem-sucedida (marca d'água), evitando reprocessamento de eventos antigos e perda de eventos em ciclos com falha
 - Agrupa os eventos coletados e os disponibiliza para consumo pelo pipeline de análise (PRD 002)
 
 ### Decisões-chave
@@ -31,7 +31,7 @@ references: []
 1. **Python SDK para coleta** — Utilizar a biblioteca `kubernetes` do Python ao invés do MCP Server. O MCP é reservado para os agentes de IA; a coleta é uma operação simples que não precisa de abstração de agente.
 2. **Loop interno na aplicação** — A coleta roda dentro do processo FastAPI como task assíncrona, sem necessidade de job externo (cron, CronJob K8s).
 3. **Intervalo configurável via variável de ambiente** — `EVENT_COLLECTION_INTERVAL_MINUTES` define o período do loop em minutos (padrão: 3 minutos), permitindo ajuste sem rebuild.
-4. **Campo `eventTime` para filtro temporal com fallback** — Utilizar o campo `eventTime` da API `events.k8s.io/v1` para filtrar eventos por timestamp. Se `eventTime` for nulo (eventos de controllers legados), usar `deprecatedLastTimestamp` como fallback. Eventos sem nenhum dos dois campos são descartados com warning no log.
+4. **Precedência de timestamps para filtro temporal** — Na API `events.k8s.io/v1`, `eventTime` registra a **primeira** observação do evento; recorrências reportadas via EventSeries atualizam apenas `series.lastObservedTime`. A recência de cada evento é determinada pela precedência: `series.lastObservedTime` (quando presente) → `eventTime` → `deprecatedLastTimestamp` (eventos de controllers legados). Eventos sem nenhum dos três campos são descartados com warning no log.
 5. **Sem limite de eventos por ciclo** — Todos os eventos Warning do intervalo são coletados e entregues, independente da quantidade.
 6. **Classe de tratamento com implementação placeholder** — Criar a classe/interface de tratamento e envio de eventos com uma implementação simples que imprime os dados no output, preparando a estrutura para o PRD 002 implementar o processamento real.
 
@@ -53,7 +53,8 @@ Como engenheiro DevOps, quero que os eventos Warning do cluster sejam coletados 
 - Apenas eventos do tipo Warning são coletados (o tipo "Error" não existe na API de eventos do Kubernetes; problemas como CrashLoopBackOff, OOMKilled e FailedScheduling são reportados como Warning)
 - A coleta abrange todos os namespaces do cluster
 - O intervalo de coleta é configurável via variável de ambiente `EVENT_COLLECTION_INTERVAL_MINUTES` em minutos (padrão: 3 minutos)
-- Apenas eventos ocorridos dentro do intervalo do loop são coletados (baseado no timestamp do evento)
+- Apenas eventos ocorridos desde a última coleta bem-sucedida são coletados (marca d'água), com recência determinada pela precedência `series.lastObservedTime` → `eventTime` → `deprecatedLastTimestamp`
+- A marca d'água só avança quando o `EventHandler` processa o batch sem erro; falha no processamento mantém a marca d'água e os eventos são reentregues no próximo ciclo
 - Eventos coletados no mesmo intervalo são agrupados antes de serem entregues ao pipeline de análise
 - Não há limite de eventos por ciclo de coleta
 - Os eventos coletados são transformados em dicts com contrato definido e entregues a uma classe de tratamento (handler) que nesta fase imprime os dados no output; a implementação real será feita no PRD 002
@@ -69,24 +70,32 @@ Como engenheiro DevOps, quero que os eventos Warning do cluster sejam coletados 
     "involved_object": {  # recurso relacionado ao evento
         "kind": str,      # tipo do recurso (ex: "Pod")
         "name": str,      # nome do recurso
-        "namespace": str  # namespace do recurso
+        "namespace": str  # namespace do recurso (vazio para recursos cluster-scoped, ex: Node)
     },
-    "timestamp": str      # ISO 8601 — eventTime ou fallback (deprecatedLastTimestamp)
+    "timestamp": str      # ISO 8601 — series.lastObservedTime, eventTime ou deprecatedLastTimestamp (nesta ordem de precedência)
 }
 ```
 
+O contrato usa nomes próprios, desacoplados do SDK. Mapeamento a partir da API `events.k8s.io/v1`: `note` → `message`, `regarding` → `involved_object` (os nomes `message` e `involvedObject` pertencem à API core/v1 e não existem na API nova).
+
 **Edge cases:**
-- Cluster inacessível durante a coleta → registrar erro no log e aguardar o próximo ciclo sem interromper o loop
+- Cluster inacessível durante a coleta → registrar erro no log e aguardar o próximo ciclo sem interromper o loop; a marca d'água não avança, então os eventos do período da falha são coletados no próximo ciclo bem-sucedido
+- `EventHandler` lança erro ao processar o batch (ex: falha do pipeline de análise do PRD 002 ou banco indisponível) → registrar erro no log e não avançar a marca d'água; os eventos são recoletados e reentregues no próximo ciclo
 - Nenhum evento Warning encontrado no intervalo → não disparar análise, aguardar próximo ciclo
 - Volume alto de eventos no mesmo intervalo → sem limite; todos os eventos são coletados e entregues como batch único
 - Variável de ambiente `EVENT_COLLECTION_INTERVAL_MINUTES` com valor inválido (não-numérico, negativo ou zero) → usar o padrão de 3 minutos e registrar warning no log
 - Permissão insuficiente no cluster (RBAC) para listar eventos → registrar erro claro no output indicando a permissão necessária e continuar o loop (tentar novamente no próximo ciclo)
-- Evento com `eventTime` nulo (controller legado) → usar `deprecatedLastTimestamp` como fallback para o campo `timestamp` do contrato de saída
-- Evento sem `eventTime` nem `deprecatedLastTimestamp` → descartar o evento e registrar warning no log
+- Evento recorrente com `series` presente (ex: FailedScheduling contínuo) → usar `series.lastObservedTime` como recência; o evento é coletado mesmo que `eventTime` (primeira observação) seja anterior à marca d'água
+- Evento com `eventTime` nulo e sem `series` (controller legado) → usar `deprecatedLastTimestamp` como fallback para recência e para o campo `timestamp` do contrato de saída
+- Evento sem `series.lastObservedTime`, `eventTime` nem `deprecatedLastTimestamp` → descartar o evento e registrar warning no log
+- Evento de recurso cluster-scoped (ex: Node) → `involved_object.namespace` é entregue como string vazia no contrato
 
 **Notas de implementação:**
 - A coleta roda como task assíncrona dentro do FastAPI (`asyncio`)
-- O filtro por timestamp deve usar o campo `eventTime` da API `events.k8s.io/v1`, com fallback para `deprecatedLastTimestamp` quando `eventTime` for nulo
+- O SDK `kubernetes` é síncrono (HTTP bloqueante) — executar as chamadas de listagem via `asyncio.to_thread` para não bloquear o event loop do FastAPI
+- Autenticação com o cluster: tentar `config.load_incluster_config()` (execução dentro do cluster) com fallback para `config.load_kube_config()` (execução local via kubeconfig)
+- O filtro temporal usa a API `events.k8s.io/v1` com precedência de recência: `series.lastObservedTime` → `eventTime` → `deprecatedLastTimestamp`
+- A marca d'água (timestamp da última coleta bem-sucedida) é mantida em memória e só avança após o `EventHandler` processar o batch sem erro; na primeira execução após o start, a janela inicial é o intervalo configurado *(premissa — confirme ou corrija)*
 - Criar uma classe handler (ex: `EventHandler`) com método de processamento que recebe a lista de eventos no formato do contrato de saída. A implementação inicial apenas imprime os dados no output (stdout), sinalizando que o processamento real será implementado no PRD 002
 
 ## 4. Critérios de Aceite
@@ -98,9 +107,10 @@ Como engenheiro DevOps, quero que os eventos Warning do cluster sejam coletados 
 | Loop de coleta executa no intervalo configurado | Teste automatizado variando o valor da env var e validando logs |
 | Apenas eventos Warning são coletados | Teste com cluster de teste contendo eventos de todos os tipos |
 | Coleta abrange todos os namespaces | Teste com eventos em múltiplos namespaces |
-| Apenas eventos dentro do intervalo do loop são coletados | Teste com eventos antigos e recentes, validando que apenas recentes são retornados |
+| Apenas eventos desde a última coleta bem-sucedida (marca d'água) são coletados | Teste com eventos antigos e recentes, validando que apenas os posteriores à marca d'água são retornados |
+| Marca d'água não avança quando o `EventHandler` falha | Teste automatizado simulando erro no handler e validando reentrega do batch no ciclo seguinte |
 | Eventos são agrupados no formato do contrato de saída e entregues ao handler | Teste de integração validando o payload entregue contra o contrato definido |
-| Fallback de timestamp funciona para eventos com eventTime nulo | Teste com evento simulado sem eventTime, validando uso de deprecatedLastTimestamp |
+| Precedência de timestamps funciona (series.lastObservedTime → eventTime → deprecatedLastTimestamp) | Testes com evento recorrente (series presente e eventTime antigo), evento sem series e evento legado sem eventTime |
 
 ### De negócio
 
@@ -116,12 +126,14 @@ Como engenheiro DevOps, quero que os eventos Warning do cluster sejam coletados 
 
 **Funcionalidades:** US01
 
-- [ ] Configurar autenticação com o cluster via Python SDK Kubernetes (US01)
-- [ ] Implementar loop assíncrono com intervalo configurável via `EVENT_COLLECTION_INTERVAL_MINUTES` (US01)
-- [ ] Filtrar eventos por tipo (Warning) e por timestamp (dentro do intervalo) com fallback de eventTime → deprecatedLastTimestamp (US01)
+- [ ] Adicionar a dependência `kubernetes` ao projeto (`uv add kubernetes`) (US01)
+- [ ] Configurar autenticação com o cluster via `load_incluster_config()` com fallback para `load_kube_config()` (US01)
+- [ ] Implementar loop assíncrono com intervalo configurável via `EVENT_COLLECTION_INTERVAL_MINUTES`, executando as chamadas do SDK via `asyncio.to_thread` (US01)
+- [ ] Filtrar eventos por tipo (Warning) e por recência desde a marca d'água, com precedência series.lastObservedTime → eventTime → deprecatedLastTimestamp (US01)
 - [ ] Implementar transformação dos eventos do SDK para o contrato de saída definido (US01)
 - [ ] Criar classe `EventHandler` com implementação placeholder que imprime eventos no output (US01)
 - [ ] Agrupar eventos coletados no formato do contrato e entregar ao `EventHandler` (US01)
+- [ ] Avançar a marca d'água somente após o `EventHandler` processar o batch sem erro (US01)
 - [ ] Tratar erros de conectividade e RBAC com logging adequado, sem interromper o loop (US01)
 
 **Critério de conclusão:**
@@ -140,7 +152,7 @@ Como engenheiro DevOps, quero que os eventos Warning do cluster sejam coletados 
 
 | Dependência | Tipo | Status | Impacto se bloqueado |
 |-------------|------|--------|----------------------|
-| Python SDK Kubernetes (`kubernetes`) | Externa | Disponível | Sem SDK, coleta não funciona |
+| Python SDK Kubernetes (`kubernetes`) | Externa | A adicionar (não está no `pyproject.toml`) | Sem SDK, coleta não funciona |
 | Acesso ao cluster Kubernetes com permissões adequadas | Interna | A configurar | Sem acesso, coleta não funciona |
 
 ## 7. Referências
@@ -153,7 +165,7 @@ Como engenheiro DevOps, quero que os eventos Warning do cluster sejam coletados 
 - **2026-03-22:** Filtragem de reprocessamento fica no PRD 002, não na coleta. Motivo: a decisão de quais eventos já foram tratados depende do estado dos relatórios, que é responsabilidade do agente de análise.
 - **2026-03-22:** Loop interno na aplicação FastAPI. Motivo: simplicidade, sem necessidade de job externo.
 - **2026-03-22:** Intervalo padrão definido em 3 minutos (variável `EVENT_COLLECTION_INTERVAL_MINUTES`).
-- **2026-03-22:** Usar campo `eventTime` da API `events.k8s.io/v1` para filtro temporal, com fallback para `deprecatedLastTimestamp` quando `eventTime` for nulo (controllers legados). Eventos sem nenhum timestamp são descartados.
+- **2026-03-22:** Usar campo `eventTime` da API `events.k8s.io/v1` para filtro temporal, com fallback para `deprecatedLastTimestamp` quando `eventTime` for nulo (controllers legados). Eventos sem nenhum timestamp são descartados. *(Substituída em 2026-06-10 — ver abaixo.)*
 - **2026-03-22:** Sem limite de eventos por ciclo de coleta. Todos são coletados e entregues.
 - **2026-03-22:** Erro de RBAC não interrompe o loop; registra no output e tenta novamente no próximo ciclo.
 - **2026-03-22:** Classe `EventHandler` criada com implementação placeholder (print no output). Processamento real será implementado no PRD 002.
@@ -161,4 +173,10 @@ Como engenheiro DevOps, quero que os eventos Warning do cluster sejam coletados 
 - **2026-03-22:** Removido tipo "Error" do escopo — não existe como tipo de evento na API Kubernetes. Apenas Warning é coletado (todos os eventos problemáticos como CrashLoopBackOff, OOMKilled, etc. já são do tipo Warning).
 - **2026-03-22:** Definido contrato de saída (dict com campos uid, type, reason, message, namespace, involved_object, timestamp) para desacoplar o handler do SDK Kubernetes.
 - **2026-03-22:** Variável de ambiente renomeada de `INTERVAL` para `EVENT_COLLECTION_INTERVAL_MINUTES` para evitar colisão e explicitar a unidade.
-- **2026-03-22:** PRD concluído — todas as tarefas do Milestone 1 implementadas. Coleta funcional em `src/aiops_k8s/collector/event_collector.py` com handler placeholder em `event_handler.py`.
+- **2026-06-10:** Filtro temporal passa a usar a precedência `series.lastObservedTime` → `eventTime` → `deprecatedLastTimestamp` (substitui a decisão de 2026-03-22). Motivo: `eventTime` registra apenas a primeira observação do evento; recorrências via EventSeries atualizam só `series.lastObservedTime` — sem a precedência, problemas contínuos (ex: FailedScheduling) deixariam de ser coletados após a primeira janela.
+- **2026-06-10:** Janela de coleta definida por marca d'água (timestamp da última coleta bem-sucedida), não por intervalo fixo. Motivo: ciclos com falha não avançam a marca d'água, evitando perda silenciosa de eventos ocorridos durante a indisponibilidade.
+- **2026-06-10:** Autenticação via `config.load_incluster_config()` com fallback para `config.load_kube_config()`. Motivo: padrão documentado do SDK; cobre execução dentro e fora do cluster.
+- **2026-06-10:** Chamadas do SDK executadas via `asyncio.to_thread`. Motivo: o SDK `kubernetes` é síncrono e bloquearia o event loop do FastAPI se chamado diretamente na task assíncrona.
+- **2026-06-10:** Mapeamento de campos da API `events.k8s.io/v1` documentado no contrato (`note` → `message`, `regarding` → `involved_object`); `involved_object.namespace` pode ser string vazia para recursos cluster-scoped (ex: Node).
+- **2026-06-10:** Removida a entrada de 2026-03-22 que dava o PRD como concluído — nenhum PRD foi implementado (confirmado pelo usuário em revisão de 2026-06-10). Status permanece `rascunho`.
+- **2026-06-10:** A marca d'água só avança quando o `EventHandler` processa o batch sem erro (refina a decisão de marca d'água acima). Motivo: eventos brutos não são persistidos; se a análise (PRD 002) falhar com a marca d'água avançada, eventos one-shot seriam perdidos silenciosamente. Decisão do usuário na revisão do PRD 002 (2026-06-10): um incidente precisa ser resolvido.
